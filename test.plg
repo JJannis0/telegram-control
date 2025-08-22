@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<PLUGIN name="TelegramControl"
+        author="Jannis"
+        version="2025.08.22"
+        pluginURL="https://raw.githubusercontent.com/JJannis0/telegram-control/main/telegram-control.plg"
+        min="6.10.0">
+
+<FILE Name="/tmp/telegram-test.txt" Run="true">
+echo "Hello from TelegramControl plugin" > /tmp/telegram-test.txt
+</FILE>
+
+</PLUGIN>
