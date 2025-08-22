@@ -21,7 +21,7 @@
   <!-- --------------------------------------------------------------- -->
   <!-- Default config                                                  -->
   <!-- --------------------------------------------------------------- -->
-  <FILE Name="/boot/config/plugins/telegram-control/telegram.cfg" Mode="0600">
+  <FILE Name="telegram-control.plg" Mode="0600">
 TOKEN=
 CHAT_IDS=
 ENABLE_AUTO_START=yes
@@ -463,5 +463,6 @@ rm -rf /usr/local/emhttp/plugins/telegram-control
   </REMOVE>
 
 </PLUGIN>
+
 
 
