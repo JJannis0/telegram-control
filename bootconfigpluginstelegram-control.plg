@@ -1,17 +1,11 @@
 <?xml version="1.0"?>
-<!--
-  Unraid Plugin: Telegram Control
-  Lets you control your Unraid server via a Telegram bot.
-  Save this file as: /boot/config/plugins/telegram-control.plg
-  Then install via the Unraid WebUI: Plugins > Install Plugin > Select local file.
--->
-<PLUGIN name="telegram-control"
-        author="srver.cc"
+<PLUGIN name="TelegramControl"
+        author="Jannis"
         version="2025.08.22"
-        launch="/Settings/TelegramControl"
-        min="6.12.0"
-        pluginURL="later"
-        support="later">
+        pluginURL="https://raw.githubusercontent.com/JJannis0/telegram-control/main/telegram-control.plg"
+        min="6.10.0"
+        support="https://github.com/JJannis0/telegram-control"
+        icon="">
 
   <CHANGES>
   2025.08.22 - Initial release (polling bot; basic commands: /help, /status, /reboot, /shutdown, /docker list|start|stop, /vm list|start|stop)
@@ -469,3 +463,4 @@ rm -rf /usr/local/emhttp/plugins/telegram-control
   </REMOVE>
 
 </PLUGIN>
+
