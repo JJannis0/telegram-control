@@ -1,0 +1,471 @@
+<?xml version="1.0"?>
+<!--
+  Unraid Plugin: Telegram Control
+  Lets you control your Unraid server via a Telegram bot.
+  Save this file as: /boot/config/plugins/telegram-control.plg
+  Then install via the Unraid WebUI: Plugins > Install Plugin > Select local file.
+-->
+<PLUGIN name="telegram-control"
+        author="srver.cc"
+        version="2025.08.22"
+        launch="/Settings/TelegramControl"
+        min="6.12.0"
+        pluginURL="later"
+        support="later">
+
+  <CHANGES>
+  2025.08.22 - Initial release (polling bot; basic commands: /help, /status, /reboot, /shutdown, /docker list|start|stop, /vm list|start|stop)
+  </CHANGES>
+
+  <!-- --------------------------------------------------------------- -->
+  <!-- Directory layout on install                                     -->
+  <!-- --------------------------------------------------------------- -->
+  <FILE Name="/usr/local/emhttp/plugins/telegram-control/" Mode="0755"></FILE>
+  <FILE Name="/usr/local/emhttp/plugins/telegram-control/scripts/" Mode="0755"></FILE>
+  <FILE Name="/boot/config/plugins/telegram-control/" Mode="0755"></FILE>
+
+  <!-- --------------------------------------------------------------- -->
+  <!-- Default config                                                  -->
+  <!-- --------------------------------------------------------------- -->
+  <FILE Name="/boot/config/plugins/telegram-control/telegram.cfg" Mode="0600">
+TOKEN=
+CHAT_IDS=
+ENABLE_AUTO_START=yes
+POLL_TIMEOUT=50
+ALLOW_ARRAY_CMDS=no
+  </FILE>
+
+  <!-- --------------------------------------------------------------- -->
+  <!-- Service script (start/stop/status)                              -->
+  <!-- --------------------------------------------------------------- -->
+  <FILE Name="/usr/local/emhttp/plugins/telegram-control/scripts/rc.telegramctl" Mode="0755">
+#!/bin/bash
+# rc.telegramctl - manage Telegram Control daemon
+
+PLUGIN_DIR="/usr/local/emhttp/plugins/telegram-control"
+CFG="/boot/config/plugins/telegram-control/telegram.cfg"
+PIDFILE="/var/run/telegramctl.pid"
+PHP_BIN="/usr/bin/php"
+DAEMON="$PLUGIN_DIR/telegramd.php"
+
+start() {
+  if [ ! -x "$PHP_BIN" ]; then
+    echo "php not found at $PHP_BIN" >&2
+    return 1
+  fi
+  if [ ! -f "$CFG" ]; then
+    echo "Config missing at $CFG" >&2
+    return 1
+  fi
+  if status; then
+    echo "telegramctl already running (pid $(cat $PIDFILE))"
+    return 0
+  fi
+  echo "Starting telegramctl..."
+  nohup "$PHP_BIN" -d detect_unicode=0 "$DAEMON" >/var/log/telegramctl.log 2>&1 &
+  echo $! > "$PIDFILE"
+  disown $(cat "$PIDFILE") 2>/dev/null
+  sleep 1
+  status
+}
+
+stop() {
+  if [ -f "$PIDFILE" ]; then
+    kill $(cat "$PIDFILE") 2>/dev/null
+    rm -f "$PIDFILE"
+    echo "telegramctl stopped"
+  else
+    echo "telegramctl not running"
+  fi
+}
+
+status() {
+  if [ -f "$PIDFILE" ] && ps -p $(cat "$PIDFILE") >/dev/null 2>&1; then
+    echo "running"
+    return 0
+  fi
+  return 1
+}
+
+restart() { stop; sleep 1; start; }
+
+case "$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) restart ;;
+  status) status && exit 0 || exit 1 ;;
+  *) echo "Usage: $0 {start|stop|restart|status}" ; exit 1 ;;
+ esac
+  </FILE>
+
+  <!-- --------------------------------------------------------------- -->
+  <!-- Telegram bot daemon (PHP, long polling)                          -->
+  <!-- --------------------------------------------------------------- -->
+  <FILE Name="/usr/local/emhttp/plugins/telegram-control/telegramd.php" Mode="0755">
+#!/usr/bin/php
+<?php
+// telegramd.php - long-polling Telegram bot for Unraid control
+// Uses only core PHP + curl; parses JSON with json_decode.
+
+$cfgPath = '/boot/config/plugins/telegram-control/telegram.cfg';
+$stateDir = '/boot/config/plugins/telegram-control';
+$offsetFile = $stateDir . '/last_update_id';
+
+function readCfg($path) {
+  $cfg = [
+    'TOKEN' => '',
+    'CHAT_IDS' => '', // comma-separated
+    'ENABLE_AUTO_START' => 'yes',
+    'POLL_TIMEOUT' => '50',
+    'ALLOW_ARRAY_CMDS' => 'no',
+  ];
+  if (!file_exists($path)) return $cfg;
+  $lines = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+  foreach ($lines as $line) {
+    if (strpos($line, '=') === false) continue;
+    list($k,$v) = array_map('trim', explode('=', $line, 2));
+    if ($k !== '') $cfg[$k] = $v;
+  }
+  return $cfg;
+}
+
+function api($token, $method, $params = []) {
+  $url = "https://api.telegram.org/bot{$token}/{$method}";
+  $ch = curl_init($url);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+  curl_setopt($ch, CURLOPT_TIMEOUT, 70);
+  curl_setopt($ch, CURLOPT_POST, true);
+  curl_setopt($ch, CURLOPT_POSTFIELDS, $params);
+  $resp = curl_exec($ch);
+  if ($resp === false) return [false, curl_error($ch)];
+  $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  curl_close($ch);
+  return [$code === 200, $resp];
+}
+
+function authAllowed($cfg, $chatId) {
+  $allowed = array_filter(array_map('trim', explode(',', $cfg['CHAT_IDS'])));
+  if (empty($allowed)) return false; // secure default
+  return in_array((string)$chatId, $allowed, true);
+}
+
+function send($token, $chatId, $text, $replyTo = null) {
+  $params = [
+    'chat_id' => $chatId,
+    'text' => $text,
+    'parse_mode' => 'MarkdownV2',
+    'disable_web_page_preview' => true,
+  ];
+  if ($replyTo) $params['reply_to_message_id'] = $replyTo;
+  api($token, 'sendMessage', $params);
+}
+
+function shell($cmd) {
+  $desc = [1 => ['pipe','w'], 2 => ['pipe','w']];
+  $proc = proc_open($cmd, $desc, $pipes);
+  if (!is_resource($proc)) return "";
+  $out = stream_get_contents($pipes[1]);
+  $err = stream_get_contents($pipes[2]);
+  foreach ($pipes as $p) fclose($p);
+  $code = proc_close($proc);
+  return trim($out . ($err ? "\n".$err : ''));
+}
+
+function sysStatus() {
+  $uptime = trim(shell_exec('uptime -p 2>/dev/null'));
+  $load = trim(shell_exec('cat /proc/loadavg | awk "{print $1, $2, $3}"'));
+  $mem = trim(shell_exec("free -h | awk '/Mem:/ {print $3".'"/"'".$2}'"));
+  $disk = trim(shell_exec("df -h --output=source,pcent | awk 'NR>1{print $1":"$2}' | paste -sd ', ' -"));
+  $md = trim(@file_get_contents('/proc/mdstat'));
+  $arrayLine = 'array: unknown';
+  if ($md) {
+    $arrayLine = (strpos($md, 'md') !== false) ? 'array: present (see /proc/mdstat)' : 'array: none';
+  }
+  return "*Uptime:* {$uptime}\n*Load:* {$load}\n*Mem:* {$mem}\n*Disks:* {$disk}\n*MD:* {$arrayLine}";
+}
+
+function listDocker() { return shell('docker ps --format "table {{.Names}}\t{{.Status}}" 2>/dev/null'); }
+function startDocker($n){ return shell('docker start '.escapeshellarg($n).' 2>&1'); }
+function stopDocker($n){ return shell('docker stop '.escapeshellarg($n).' 2>&1'); }
+
+function listVM() { return shell('virsh list --all 2>/dev/null'); }
+function startVM($n){ return shell('virsh start '.escapeshellarg($n).' 2>&1'); }
+function stopVM($n){ return shell('virsh shutdown '.escapeshellarg($n).' 2>&1'); }
+
+function arrayCmdAllowed($cfg){ return strtolower($cfg['ALLOW_ARRAY_CMDS'])==='yes'; }
+function arrayStart(){ return shell('/usr/local/sbin/emcmd start 2>&1'); }
+function arrayStop(){ return shell('/usr/local/sbin/emcmd stop 2>&1'); }
+
+$cfg = readCfg($cfgPath);
+$token = $cfg['TOKEN'];
+if (!$token) {
+  file_put_contents('php://stderr', "[telegramd] No TOKEN set in $cfgPath\n");
+  exit(1);
+}
+
+$last = 0;
+if (file_exists($offsetFile)) $last = (int)trim(file_get_contents($offsetFile));
+
+send($token, explode(',', $cfg['CHAT_IDS'])[0] ?? '', "Telegram Control bot started on *".php_uname('n')."*\nType /help", null);
+
+while (true) {
+  $params = [
+    'timeout' => (int)$cfg['POLL_TIMEOUT'],
+    'offset' => $last ? ($last+1) : 0,
+    'allowed_updates' => json_encode(['message'])
+  ];
+  list($ok, $resp) = api($token, 'getUpdates', $params);
+  if (!$ok) { sleep(3); continue; }
+  $data = json_decode($resp, true);
+  if (!$data || empty($data['ok'])) { sleep(2); continue; }
+  foreach ($data['result'] as $u) {
+    $last = max($last, (int)$u['update_id']);
+    file_put_contents($offsetFile, (string)$last);
+    if (!isset($u['message'])) continue;
+    $m = $u['message'];
+    $chatId = (string)$m['chat']['id'];
+    $msgId = $m['message_id'] ?? null;
+    $text = trim($m['text'] ?? '');
+
+    if (!authAllowed($cfg, $chatId)) {
+      send($token, $chatId, "Unauthorized chat ID.");
+      continue;
+    }
+
+    $cmd = strtolower(strtok($text, ' '));
+    $arg = trim(substr($text, strlen($cmd)));
+
+    switch ($cmd) {
+      case '/help':
+        $help = "*Commands*\n".
+          "/help — this help\n".
+          "/status — system status\n".
+          "/reboot — reboot server\n".
+          "/shutdown — poweroff server\n".
+          "/docker list — list containers\n".
+          "/docker start <name> — start container\n".
+          "/docker stop <name> — stop container\n".
+          "/vm list — list VMs\n".
+          "/vm start <name> — start VM\n".
+          "/vm stop <name> — stop (ACPI shutdown) VM\n".
+          (arrayCmdAllowed($cfg) ? "/array start|stop — *dangerous* control array\n" : "");
+        send($token, $chatId, $help, $msgId);
+        break;
+
+      case '/status':
+        send($token, $chatId, sysStatus(), $msgId);
+        break;
+
+      case '/reboot':
+        send($token, $chatId, "Rebooting...", $msgId);
+        shell('logger "telegram-control: reboot via Telegram"');
+        shell('nohup bash -c "sleep 2; /sbin/reboot" >/dev/null 2>&1 &');
+        break;
+
+      case '/shutdown':
+        send($token, $chatId, "Powering off...", $msgId);
+        shell('logger "telegram-control: shutdown via Telegram"');
+        shell('nohup bash -c "sleep 2; /sbin/poweroff" >/dev/null 2>&1 &');
+        break;
+
+      case '/docker':
+        if ($arg === 'list') {
+          $out = listDocker();
+          send($token, $chatId, "``".$out."``", $msgId);
+        } else if (strpos($arg, 'start ') === 0) {
+          $name = trim(substr($arg, 6));
+          $out = startDocker($name);
+          send($token, $chatId, "``".$out."``", $msgId);
+        } else if (strpos($arg, 'stop ') === 0) {
+          $name = trim(substr($arg, 5));
+          $out = stopDocker($name);
+          send($token, $chatId, "``".$out."``", $msgId);
+        } else {
+          send($token, $chatId, "Usage: /docker list|start <name>|stop <name>", $msgId);
+        }
+        break;
+
+      case '/vm':
+        if ($arg === 'list') {
+          $out = listVM();
+          send($token, $chatId, "``".$out."``", $msgId);
+        } else if (strpos($arg, 'start ') === 0) {
+          $name = trim(substr($arg, 6));
+          $out = startVM($name);
+          send($token, $chatId, "``".$out."``", $msgId);
+        } else if (strpos($arg, 'stop ') === 0) {
+          $name = trim(substr($arg, 5));
+          $out = stopVM($name);
+          send($token, $chatId, "``".$out."``", $msgId);
+        } else {
+          send($token, $chatId, "Usage: /vm list|start <name>|stop <name>", $msgId);
+        }
+        break;
+
+      case '/array':
+        if (!arrayCmdAllowed($cfg)) { send($token,$chatId,"Array commands disabled in settings.",$msgId); break; }
+        if ($arg === 'start') { $out = arrayStart(); send($token,$chatId,"``".$out."``",$msgId); }
+        else if ($arg === 'stop') { $out = arrayStop(); send($token,$chatId,"``".$out."``",$msgId); }
+        else send($token,$chatId,"Usage: /array start|stop",$msgId);
+        break;
+
+      default:
+        if ($cmd !== '') send($token, $chatId, "Unknown command. Try /help", $msgId);
+    }
+  }
+}
+?>
+  </FILE>
+
+  <!-- --------------------------------------------------------------- -->
+  <!-- Unraid Settings page                                             -->
+  <!-- --------------------------------------------------------------- -->
+  <FILE Name="/usr/local/emhttp/plugins/telegram-control/TelegramControl.page" Mode="0644">
+<?php
+$cfg = '/boot/config/plugins/telegram-control/telegram.cfg';
+if (!file_exists($cfg)) touch($cfg);
+$ini = @parse_ini_file($cfg, false, INI_SCANNER_RAW);
+$TOKEN = $ini['TOKEN'] ?? '';
+$CHAT_IDS = $ini['CHAT_IDS'] ?? '';
+$ENABLE_AUTO_START = $ini['ENABLE_AUTO_START'] ?? 'yes';
+$POLL_TIMEOUT = $ini['POLL_TIMEOUT'] ?? '50';
+$ALLOW_ARRAY_CMDS = $ini['ALLOW_ARRAY_CMDS'] ?? 'no';
+?>
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Telegram Control</title>
+  <style>
+    .note{opacity:.8}
+    .row{margin:6px 0}
+    input[type=text]{width:480px}
+  </style>
+</head>
+<body>
+  <h2>Telegram Control</h2>
+  <form method="post" action="/plugins/telegram-control/scripts/settings">
+    <div class="row">
+      <label>Bot Token:</label><br>
+      <input type="text" name="TOKEN" value="<?=htmlspecialchars($TOKEN)?>" placeholder="123456:ABC-DEF..." />
+    </div>
+    <div class="row">
+      <label>Allowed Chat IDs (comma-separated):</label><br>
+      <input type="text" name="CHAT_IDS" value="<?=htmlspecialchars($CHAT_IDS)?>" placeholder="123456789,987654321" />
+    </div>
+    <div class="row">
+      <label>Auto-Start daemon on boot:</label>
+      <select name="ENABLE_AUTO_START">
+        <option value="yes" <?=($ENABLE_AUTO_START==='yes'?'selected':'')?>>yes</option>
+        <option value="no" <?=($ENABLE_AUTO_START==='no'?'selected':'')?>>no</option>
+      </select>
+    </div>
+    <div class="row">
+      <label>Poll timeout (seconds, 1-50):</label>
+      <input type="text" name="POLL_TIMEOUT" value="<?=htmlspecialchars($POLL_TIMEOUT)?>" />
+    </div>
+    <div class="row">
+      <label>Allow array start/stop commands (dangerous):</label>
+      <select name="ALLOW_ARRAY_CMDS">
+        <option value="no" <?=($ALLOW_ARRAY_CMDS==='no'?'selected':'')?>>no</option>
+        <option value="yes" <?=($ALLOW_ARRAY_CMDS==='yes'?'selected':'')?>>yes</option>
+      </select>
+    </div>
+    <div class="row">
+      <button type="submit">Save</button>
+    </div>
+  </form>
+
+  <hr>
+  <h3>Daemon control</h3>
+  <form method="post" action="/plugins/telegram-control/scripts/settings">
+    <input type="hidden" name="action" value="start"/>
+    <button type="submit">Start</button>
+  </form>
+  <form method="post" action="/plugins/telegram-control/scripts/settings">
+    <input type="hidden" name="action" value="stop"/>
+    <button type="submit">Stop</button>
+  </form>
+  <form method="post" action="/plugins/telegram-control/scripts/settings">
+    <input type="hidden" name="action" value="restart"/>
+    <button type="submit">Restart</button>
+  </form>
+  <p class="note">Log: /var/log/telegramctl.log · Service: /usr/local/emhttp/plugins/telegram-control/scripts/rc.telegramctl</p>
+</body>
+</html>
+  </FILE>
+
+  <!-- --------------------------------------------------------------- -->
+  <!-- Settings handler (save + start/stop)                             -->
+  <!-- --------------------------------------------------------------- -->
+  <FILE Name="/usr/local/emhttp/plugins/telegram-control/scripts/settings" Mode="0755">
+#!/bin/bash
+CFG="/boot/config/plugins/telegram-control/telegram.cfg"
+RC="/usr/local/emhttp/plugins/telegram-control/scripts/rc.telegramctl"
+mkdir -p /boot/config/plugins/telegram-control
+
+if [ "$REQUEST_METHOD" = "POST" ]; then
+  ACTION=$(php -r 'echo $_POST["action"] ?? "";')
+  if [ -z "$ACTION" ]; then
+    TOKEN=$(php -r 'echo $_POST["TOKEN"] ?? "";')
+    CHAT_IDS=$(php -r 'echo $_POST["CHAT_IDS"] ?? "";')
+    ENABLE_AUTO_START=$(php -r 'echo $_POST["ENABLE_AUTO_START"] ?? "yes";')
+    POLL_TIMEOUT=$(php -r 'echo $_POST["POLL_TIMEOUT"] ?? "50";')
+    ALLOW_ARRAY_CMDS=$(php -r 'echo $_POST["ALLOW_ARRAY_CMDS"] ?? "no";')
+    cat > "$CFG" <<EOF
+TOKEN=$TOKEN
+CHAT_IDS=$CHAT_IDS
+ENABLE_AUTO_START=$ENABLE_AUTO_START
+POLL_TIMEOUT=$POLL_TIMEOUT
+ALLOW_ARRAY_CMDS=$ALLOW_ARRAY_CMDS
+EOF
+  else
+    case "$ACTION" in
+      start)   "$RC" start   ;; 
+      stop)    "$RC" stop    ;;
+      restart) "$RC" restart ;;
+    esac
+  fi
+fi
+
+# Redirect back to settings page
+HEADER="Status: 302 Found\r\nLocation: /Settings/TelegramControl\r\n\r\n"
+echo -en "$HEADER"
+  </FILE>
+
+  <!-- --------------------------------------------------------------- -->
+  <!-- Install / Remove hooks                                          -->
+  <!-- --------------------------------------------------------------- -->
+  <SCRIPT>
+#!/bin/bash
+# on install/upgrade
+mkdir -p /usr/local/emhttp/plugins/telegram-control/scripts
+mkdir -p /boot/config/plugins/telegram-control
+# auto-start on boot via /boot/config/go fragment
+GOFRAG=/boot/config/plugins/telegram-control/go-telegramctl.sh
+if [ ! -f "$GOFRAG" ]; then
+  cat > "$GOFRAG" <<'EOF'
+#!/bin/bash
+# Start Telegram Control on boot if enabled
+CFG="/boot/config/plugins/telegram-control/telegram.cfg"
+RC="/usr/local/emhttp/plugins/telegram-control/scripts/rc.telegramctl"
+[ -f "$CFG" ] || exit 0
+EN=$(grep -E '^ENABLE_AUTO_START=' "$CFG" | cut -d= -f2)
+if [ "$EN" = "yes" ]; then
+  "$RC" start
+fi
+EOF
+  chmod +x "$GOFRAG"
+fi
+  </SCRIPT>
+
+  <REMOVE>
+#!/bin/bash
+# stop service and clean runtime files; keep user config
+/usr/local/emhttp/plugins/telegram-control/scripts/rc.telegramctl stop >/dev/null 2>&1 || true
+rm -f /var/run/telegramctl.pid
+rm -f /var/log/telegramctl.log
+rm -rf /usr/local/emhttp/plugins/telegram-control
+# do NOT delete /boot/config/plugins/telegram-control to preserve settings
+  </REMOVE>
+
+</PLUGIN>
